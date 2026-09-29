@@ -1,0 +1,90 @@
+# Builds and tests every push and pull request. Pushes to main replace the
+# "dev" pre-release; v* tags publish a release.
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  LLVM_MINGW: llvm-mingw-20260922-msvcrt-ubuntu-22.04-x86_64
+  LLVM_MINGW_SHA256: 17bbc667b96f7b1f02ce4a172d8cac4fa480927a1f649e788dee5914919566a1
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install toolchain and Wine
+        run: |
+          curl -fsSL -o /tmp/llvm-mingw.tar.xz \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/20260922/$LLVM_MINGW.tar.xz"
+          echo "$LLVM_MINGW_SHA256  /tmp/llvm-mingw.tar.xz" | sha256sum -c -
+          sudo tar -xf /tmp/llvm-mingw.tar.xz -C /opt
+          echo "/opt/$LLVM_MINGW/bin" >> "$GITHUB_PATH"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends wine wine64 xvfb
+
+      - name: Test
+        run: xvfb-run -a make test test-release
+
+      - name: Package
+        run: make package
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dungeons2forlinux
+          path: |
+            build/dungeons2forlinux-*.tar.gz
+            build/dungeons2forlinux-*.tar.gz.sha256
+          if-no-files-found: error
+
+  dev:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: dev-release
+      cancel-in-progress: true
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dungeons2forlinux
+          path: release
+      - name: Replace the dev pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete dev --cleanup-tag --yes --repo "$GITHUB_REPOSITORY" || true
+          gh release create dev release/* --repo "$GITHUB_REPOSITORY" --prerelease --target "$GITHUB_SHA" \
+            --title "Development build" \
+            --notes "Built from $GITHUB_SHA on main. For testing changes before the next release."
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dungeons2forlinux
+          path: release
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" release/* --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" --generate-notes
